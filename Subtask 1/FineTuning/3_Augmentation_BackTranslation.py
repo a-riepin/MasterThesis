@@ -1,36 +1,8 @@
-#!/usr/bin/env python
-# coding: utf-8
 
-# In[1]:
-
-
-from google.colab import drive
-drive.mount('/content/drive')
-
-
-# In[2]:
-
-
-get_ipython().system("unzip -qq '/content/drive/MyDrive/data.zip'")
-
-
-# In[3]:
-
-
-get_ipython().system('pip install -q -U --no-cache-dir gdown --pre')
 get_ipython().system('pip install -q transformers datasets evaluate accelerate')
 get_ipython().system('pip install -q requests nlpaug sentencepiece')
 get_ipython().system('pip install torch -U')
-
-
-# In[4]:
-
-
 get_ipython().system('pip install -q googletrans==3.1.0a0')
-
-
-# In[5]:
-
 
 # Standard modules
 import os
@@ -50,12 +22,11 @@ import googletrans
 from googletrans import Translator
 from sklearn.utils.class_weight import compute_class_weight
 import torch
-from sklearn.model_selection import ParameterGrid
+from sklearn.model_selection import ParameterGrid, StratifiedShuffleSplit
 import matplotlib.pyplot as plt
 
 
-# In[6]:
-
+root_folder = '/home/ubunti/datastore/riepin/Test_Rie/New_Project/0_data/raw/'
 
 # Function to create dataframes
 def make_dataframe(input_folder, labels_folder=None):
@@ -81,10 +52,6 @@ def read_lang_data(train_folder, train_labels, val_folder, val_labels):
     df_val_lang = make_dataframe(val_folder, val_labels).rename(columns={"type": "label"})
     return df_train_lang, df_val_lang
 
-
-# In[7]:
-
-
 # Evaluation metrics
 recall_metric = evaluate.load("recall")
 precision_metric = evaluate.load("precision")
@@ -102,42 +69,40 @@ def eval_metrics(eval_pred):
     })
     return results
 
-
-# In[8]:
-
-
-
 # Data loading
 def load_data():
     data_dict = {}
     languages = ['en', 'fr', 'ge', 'it', 'po', 'ru']
     for lang in languages:
-        train_folder = f"data/{lang}/train-articles-subtask-1/"
-        train_labels = f"data/{lang}/train-labels-subtask-1.txt"
-        dev_folder = f"data/{lang}/dev-articles-subtask-1/"
-        dev_labels = f"data/{lang}/dev-labels-subtask-1.txt"
+        train_folder = f"{root_folder}/{lang}/train-articles-subtask-1/"
+        train_labels = f"{root_folder}/{lang}/train-labels-subtask-1.txt"
+        dev_folder = f"{root_folder}/{lang}/dev-articles-subtask-1/"
+        dev_labels = f"{root_folder}/{lang}/dev-labels-subtask-1.txt"
         df_train, df_dev = read_lang_data(train_folder, train_labels, dev_folder, dev_labels)
         data_dict[lang] = {'train': df_train, 'dev': df_dev, 'combined': pd.concat([df_train, df_dev])}
     return data_dict
 
-
-# In[9]:
-
-
-# Create datasets
+# Create datasets with stratified sampling
 def create_datasets(data_dict):
     datasets = {}
     labels = ['opinion', 'satire', 'reporting']
     ClassLabels = ClassLabel(num_classes=len(labels), names=labels)
     for key, el in data_dict.items():
-        dataset = Dataset.from_pandas(el['combined'], preserve_index=True).cast_column("label", ClassLabels).train_test_split(test_size=0.2)
-        val_dataset = Dataset.from_pandas(el['dev'], preserve_index=True).cast_column("label", ClassLabels)
-        datasets[key] = DatasetDict({'train': dataset['train'], 'test': dataset['test'], 'val': val_dataset})
+        combined_df = el['combined'].reset_index()
+        X = combined_df.index.values
+        y = combined_df['label'].values
+        
+        sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+        for train_index, test_index in sss.split(X, y):
+            train_df = combined_df.iloc[train_index]
+            test_df = combined_df.iloc[test_index]
+        
+        train_dataset = Dataset.from_pandas(train_df).cast_column("label", ClassLabels)
+        test_dataset = Dataset.from_pandas(test_df).cast_column("label", ClassLabels)
+        val_dataset = Dataset.from_pandas(el['dev'].reset_index()).cast_column("label", ClassLabels)
+        
+        datasets[key] = DatasetDict({'train': train_dataset, 'test': test_dataset, 'val': val_dataset})
     return datasets
-
-
-# In[10]:
-
 
 # Google Translator augmentation
 def augment_data(datasets):
@@ -156,10 +121,6 @@ def augment_data(datasets):
         datasets['en']['train'] = datasets['en']['train'].add_item(item)
     return datasets
 
-
-# In[11]:
-
-
 # Tokenization
 def tokenize_datasets(datasets, tokenizer):
     tokenized_datasets = {}
@@ -167,16 +128,8 @@ def tokenize_datasets(datasets, tokenizer):
         tokenized_datasets[key] = el.map(lambda examples: tokenizer(examples["text"], padding="max_length", truncation=True), batched=True, remove_columns=["text"])
     return tokenized_datasets
 
-
-# In[14]:
-
-
 def model_init_roberta():
     return AutoModelForSequenceClassification.from_pretrained("xlm-roberta-base", num_labels=3)
-
-
-# In[20]:
-
 
 # Main script
 def main():
@@ -199,15 +152,13 @@ def main():
     class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(y), y=np.asarray(y))
     class_weights = tensor(class_weights, dtype=torch.float).cuda()
 
-    # Define the model initialization function
     def model_init_roberta():
         return AutoModelForSequenceClassification.from_pretrained("xlm-roberta-base", num_labels=len(labels))
 
-    # Define the hyperparameter grid for tuning
     hyperparameter_grid = {
-        "num_train_epochs": [2,3],
-        "learning_rate": [3e-5],
-        "per_device_batch_size": [8],
+        "num_train_epochs": [10, 15],
+        "learning_rate": [2e-5, 3e-5, 4e-5],
+        "per_device_batch_size": [8, 16],
     }
 
     best_params_global = None
@@ -215,16 +166,13 @@ def main():
     best_model_for_english = 0.0
     all_results = []
 
-    # Lists to store results for plotting
     iterations = []
     avg_f1_macros = []
 
-    # Perform grid search
     for i, params in enumerate(ParameterGrid(hyperparameter_grid)):
         print('-----'*4)
         print(f"Iteration {i + 1}: Training with hyperparameters {params}")
 
-        # Training and evaluating bert
         training_args = TrainingArguments(
             output_dir="output_trainer",
             evaluation_strategy="epoch",
@@ -247,13 +195,11 @@ def main():
         )
 
         trainer.train()
-        # Evaluate on the combined validation set for parameter tuning
         evaluate_results = {}
         for lang in datasets.keys():
             ans_combined = trainer.evaluate(tokenized_datasets[lang]['val'])
             evaluate_results[lang] = ans_combined
 
-        # Calculate average F1 macro across all languages
         avg_f1_macro = sum(result['eval_f1_macro'] for result in evaluate_results.values()) / len(datasets)
 
         all_results.append({
@@ -263,13 +209,11 @@ def main():
             'trainer': trainer
         })
 
-        # Update best parameters if the current set performs better globally
         if avg_f1_macro > best_f1_macro_global:
             best_f1_macro_global = avg_f1_macro
             best_params_global = params
             best_index = i
 
-        # Check if the F1 macro for English is the highest
         if evaluate_results['en']['eval_f1_macro'] > best_model_for_english:
             best_model_for_english = evaluate_results['en']['eval_f1_macro']
             best_model_params_for_english = params
@@ -282,29 +226,22 @@ def main():
     print("Best model hyperparameters for English:", best_model_params_for_english)
     print("Best F1 macro for English:", best_model_for_english)
 
-    # Visualize results
     plt.plot(range(len(all_results)), [result['avg_f1_macro'] for result in all_results], marker='o')
     plt.xlabel('Iteration')
     plt.ylabel('Average F1 Macro')
     plt.title('Grid Search for Hyperparameter Tuning')
-    plt.xticks(rotation=90)  # Rotate x-axis tick labels
-
+    plt.xticks(rotation=90)
     plt.show()
 
-
-    # Save the index of the model with the best parameters to a variable
     best_model_index = best_index
-
-    # Set trainer to the best model trainer
     trainer = all_results[best_model_index]['trainer']
 
-    # Prediction code
     data_pred_dict = {}
-    languages = [ 'en','es', 'fr', 'ge', 'gr', 'it', 'ka', 'po', 'ru']
+    languages = ['en', 'es', 'fr', 'ge', 'gr', 'it', 'ka', 'po', 'ru']
     label_mapping = {0: 'opinion', 1: 'satire', 2: 'reporting'}
 
     for lang in languages:
-        predict_folder = f"data/{lang}/test-articles-subtask-1/"
+        predict_folder = f"{root_folder}/{lang}/test-articles-subtask-1/"
         df_pred_lang = make_dataframe(predict_folder, labels_folder=None)
         data_pred_dict[lang] = {'pred': df_pred_lang}
 
@@ -319,16 +256,5 @@ def main():
         pred_ans_df['Value'] = pred_ans_df['Value'].replace(label_mapping)
         pred_ans_df.to_csv(f'{language}_augmented_all_best.txt', sep='\t', index=False, header=False)
 
-
-# In[21]:
-
-
 if __name__ == "__main__":
     main()
-
-
-# In[ ]:
-
-
-
-
